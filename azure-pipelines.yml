@@ -1,0 +1,220 @@
+# =============================================================================
+# Pipeline: Detect changes (checksums) -> DEV (auto) -> UAT (approval) -> TEST (approval)
+#
+# Notes
+#  * Approvals cannot be declared in YAML. They are configured on the Azure DevOps
+#    Environments named DEV / UAT / TEST (Pipelines > Environments > <env> >
+#    Approvals and checks). Add an "Approvals" check on UAT and on TEST only.
+#    DEV has no approval, so it deploys automatically.
+#  * "Merged via PR" is enforced by (a) trigger on `dev` only, (b) pr: none, and
+#    (c) a commit-message guard in the Detect stage (Azure Repos writes
+#    "Merged PR <id>: ..." for completed PRs, including squash merges).
+#  * Baseline for change detection = manifest of the last SUCCESSFUL run on `dev`.
+#    A run only succeeds once TEST is deployed, so changes that were rejected or
+#    failed in UAT/TEST are automatically re-detected on the next run.
+# =============================================================================
+
+name:Syg-pipeline
+
+trigger:
+  branches:
+    include:
+      - dev
+  paths:
+    include:
+      - Agents/*
+      - prompts/*
+      - Prompts/*   # repo currently uses a capitalised "Prompts" folder; git paths are case-sensitive
+      - skills/*
+
+pr: none   # never build on PR validation; only on the merge into dev
+
+variables:
+  - name: tracked_roots
+    value: 'Agents prompts Prompts skills'
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  # Order matters: each environment depends on the previous one.
+  - name: environments
+    type: object
+    default:
+      # Detect is listed in every dependsOn so its outputs are readable in the condition.
+      - name: DEV
+        dependsOn: [Detect]
+      - name: UAT
+        dependsOn: [Detect, DEV]
+      - name: TEST
+        dependsOn: [Detect, UAT]
+
+stages:
+  # ---------------------------------------------------------------------------
+  # 1. DETECT CHANGES
+  # ---------------------------------------------------------------------------
+  - stage: Detect
+    displayName: Detect changes (checksums)
+    jobs:
+      - job: Detect
+        displayName: Compute checksums and diff against last successful run
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          # Baseline manifest from the last successful run of this pipeline on dev.
+          # Absent on the very first run -> everything is treated as changed.
+          - task: DownloadPipelineArtifact@2
+            displayName: Download baseline manifest
+            continueOnError: true
+            inputs:
+              source: specific
+              project: $(System.TeamProjectId)
+              pipeline: $(System.DefinitionId)
+              runVersion: latestFromBranch
+              runBranch: refs/heads/dev
+              allowPartiallySucceededBuilds: false
+              allowFailedBuilds: false
+              artifact: manifest
+              path: $(Pipeline.Workspace)/baseline
+
+          - bash: |
+              set -euo pipefail
+              out="$(Build.ArtifactStagingDirectory)/changes"
+              mkdir -p "$out"
+
+              # --- Guard: only act on commits produced by a completed PR ----------
+              msg='$(Build.SourceVersionMessage)'
+              if [[ "$msg" != Merged\ PR* ]]; then
+                echo "Commit is not a PR merge ('$msg'). Nothing to deploy."
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+                echo '{"changed":[],"deleted":[]}' > "$out/changes.json"
+                : > "$out/manifest.tsv"
+                exit 0
+              fi
+
+              # --- 1. Checksum every tracked file ---------------------------------
+              : > "$out/files.txt"
+              for root in $(tracked_roots); do
+                if [ -d "$root" ]; then
+                  find "$root" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum >> "$out/files.txt"
+                fi
+              done
+
+              # --- 2. Group into components ---------------------------------------
+              # Component = Root/<first-level child> (a sub-folder or a single file).
+              # Folder components get one combined checksum over all files inside.
+              awk '{h=substr($0,1,64); p=substr($0,67); n=split(p,a,"/");
+                    c=(n>2)?a[1]"/"a[2]:p; printf "%s\t%s  %s\n", c, h, p}' \
+                  "$out/files.txt" | LC_ALL=C sort > "$out/_files.tsv"
+
+              cut -f1 "$out/_files.tsv" | uniq | while IFS= read -r comp; do
+                h=$(awk -F'\t' -v c="$comp" '$1==c{print $2}' "$out/_files.tsv" | sha256sum | cut -d' ' -f1)
+                printf '%s\t%s\n' "$comp" "$h"
+              done > "$out/manifest.tsv"
+
+              # --- 3. Diff against baseline ---------------------------------------
+              base="$(Pipeline.Workspace)/baseline/manifest.tsv"
+              if [ -f "$base" ]; then
+                echo "Baseline found: $(wc -l < "$base") components"
+              else
+                echo "No baseline found - treating all components as changed."
+                : > "$base"
+              fi
+
+              # changed = new or checksum differs ; deleted = in baseline, not now
+              changed=$(awk -F'\t' 'NR==FNR{b[$1]=$2; next} !($1 in b) || b[$1]!=$2 {print $1}' \
+                          "$base" "$out/manifest.tsv")
+              deleted=$(awk -F'\t' 'NR==FNR{c[$1]=1; next} !($1 in c){print $1}' \
+                          "$out/manifest.tsv" "$base")
+
+              to_json() { printf '%s' "$1" | jq -R -s -c 'split("\n") | map(select(length>0))'; }
+              jq -n --argjson c "$(to_json "$changed")" --argjson d "$(to_json "$deleted")" \
+                 '{changed:$c, deleted:$d}' > "$out/changes.json"
+
+              rm -f "$out/_files.tsv" "$out/files.txt"
+
+              echo "---- Detected changes ----"
+              jq . "$out/changes.json"
+
+              if [ -n "$changed$deleted" ]; then
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]true"
+              else
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+              fi
+            name: detect
+            displayName: Checksum tracked folders and detect changes
+
+          # changes.json = the single source of truth promoted through DEV -> UAT -> TEST.
+          # manifest.tsv = baseline for the next run.
+          - publish: $(Build.ArtifactStagingDirectory)/changes/changes.json
+            artifact: changes
+            displayName: Publish detected changes
+
+          - publish: $(Build.ArtifactStagingDirectory)/changes/manifest.tsv
+            artifact: manifest
+            displayName: Publish manifest (next run's baseline)
+
+  # ---------------------------------------------------------------------------
+  # 2. DEPLOY  DEV (automatic) -> UAT (approval) -> TEST (approval)
+  #    Approvals are enforced by the Environment's checks (see header).
+  # ---------------------------------------------------------------------------
+  - ${{ each env in parameters.environments }}:
+      - stage: ${{ env.name }}
+        displayName: Deploy to ${{ env.name }}
+        dependsOn: ${{ env.dependsOn }}
+        # Run only if changes were detected upstream and every prior stage succeeded.
+        condition: |
+          and(
+            succeeded(),
+            eq(dependencies.Detect.outputs['Detect.detect.hasChanges'], 'true')
+          )
+        variables:
+          targetEnv: ${{ env.name }}
+        jobs:
+          - deployment: Deploy_${{ env.name }}
+            displayName: Deploy changed components to ${{ env.name }}
+            environment: ${{ env.name }}     # approval gate lives on this environment
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: self
+                      fetchDepth: 1
+
+                    # Same changes.json produced once in Detect for every environment.
+                    - download: current
+                      artifact: changes
+                      displayName: Download detected changes
+
+                    - bash: |
+                        set -euo pipefail
+                        manifest="$(Pipeline.Workspace)/changes/changes.json"
+                        echo "Deploying to $(targetEnv):"
+                        jq . "$manifest"
+
+                        deploy_component() {
+                          local comp="$1"
+                          case "$comp" in
+                            Agents/*)  echo "[$(targetEnv)] Deploy agent:  $comp"
+                                       # TODO: replace with real deploy command for agents
+                                       ;;
+                            prompts/*|Prompts/*)
+                                       echo "[$(targetEnv)] Deploy prompt: $comp"
+                                       # TODO: replace with real deploy command for prompts
+                                       ;;
+                            skills/*)  echo "[$(targetEnv)] Deploy skill:  $comp"
+                                       # TODO: replace with real deploy command for skills
+                                       ;;
+                            *)         echo "Unknown component, skipping: $comp" ;;
+                          esac
+                        }
+
+                        remove_component() {
+                          echo "[$(targetEnv)] Remove: $1"
+                          # TODO: replace with real un-deploy command
+                        }
+
+                        jq -r '.changed[]' "$manifest" | while IFS= read -r c; do deploy_component "$c"; done
+                        jq -r '.deleted[]' "$manifest" | while IFS= read -r c; do remove_component "$c"; done
+                      displayName: Deploy changed components
