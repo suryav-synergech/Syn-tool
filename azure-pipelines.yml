@@ -25,16 +25,17 @@ trigger:
       - dev
   paths:
     include:
-      - Agents/*
-      - prompts/*
-      - Prompts/*   # repo currently uses a capitalised "Prompts" folder; git paths are case-sensitive
+      # Folder names must match the repo exactly (git paths are case-sensitive on Linux).
+      - agents/*
+      - prompt/*
       - skills/*
+      - skills-test/*
 
 pr: none   # never build on PR validation; only on the merge into dev
 
 variables:
   - name: tracked_roots
-    value: 'Agents prompts Prompts skills'
+    value: 'agents prompt skills skills-test'
 
 pool:
   vmImage: ubuntu-latest
@@ -243,8 +244,8 @@ stages:
 
                         # --- helpers ------------------------------------------------------------
                         # ASSUMED API CONTRACT (adjust to the real API once known):
-                        #   PUT    {base}/agents|prompts|skills/{name}   multipart field "file"
-                        #   DELETE {base}/agents|prompts|skills/{name}
+                        #   PUT    {base}/agents|prompts|skills|skills-test/{name}   multipart field "file"
+                        #   DELETE {base}/agents|prompts|skills|skills-test/{name}
                         #   Auth:  Authorization: Bearer <token>
                         # A folder component is zipped; a single-file component is sent as is.
                         # {name} = folder name, or file name without extension.
@@ -263,9 +264,10 @@ stages:
 
                         kind_of() {
                           case "$1" in
-                            Agents/*)            echo agents ;;
-                            prompts/*|Prompts/*) echo prompts ;;
-                            skills/*)            echo skills ;;
+                            agents/*) echo agents ;;
+                            prompt/*) echo prompts ;;   # folder is `prompt`, API path is /prompts
+                            skills/*) echo skills ;;
+                            skills-test/*) echo skills-test ;;
                             *)                   echo "" ;;
                           esac
                         }
