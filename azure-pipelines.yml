@@ -12,6 +12,9 @@
 #    squash/rebase title ending in "(#<n>)"), so it works while the code is still
 #    on GitHub and after a move to Azure Repos. Also add a branch protection rule
 #    on `dev` (require PRs) - the message check alone is not real security.
+#  * Branches follow the stages: `dev` is the trigger; after a real successful deploy the
+#    pipeline fast-forwards the `uat` and `prod` branches to the deployed commit. This needs
+#    permission to push to those branches (see the notes in the Azure DevOps setup).
 #  * Baseline for change detection = manifest of the last SUCCESSFUL run on `dev`.
 #    A run only succeeds once PROD is deployed, so changes that were rejected or
 #    failed in UAT/PROD are automatically re-detected on the next run.
@@ -210,6 +213,7 @@ stages:
                   steps:
                     - checkout: self
                       fetchDepth: 1
+                      persistCredentials: true   # needed to push the uat/prod branch after deploy
 
                     # Same changes.json produced once in Detect for every environment.
                     - download: current
@@ -311,8 +315,27 @@ stages:
                           ( remove_component "$c" ) || { echo "##vso[task.logissue type=error]Remove failed: $c"; failed=1; }
                         done < <(jq -r '.deleted[]' "$manifest")
 
+                        # Tell the next step this was a real deploy (not a dry run).
+                        if ! $dry_run; then
+                          echo "##vso[task.setvariable variable=deployedForReal]true"
+                        fi
+
                         exit $failed
                       displayName: Deploy changed components via API
                       env:
                         API_BASE_URL: $(API_BASE_URL_${{ env.name }})
                         API_TOKEN: $(API_TOKEN_${{ env.name }})
+
+                    # Keep the environment branch in step with the pipeline: after a REAL,
+                    # successful deploy, fast-forward the `uat` / `prod` branch to the commit
+                    # that was just deployed. DEV needs nothing (it is the `dev` branch itself).
+                    # Fast-forward only (no --force): if the branch has diverged, the push fails
+                    # loudly instead of overwriting anything.
+                    - ${{ if ne(env.name, 'DEV') }}:
+                      - bash: |
+                          set -euo pipefail
+                          branch='${{ lower(env.name) }}'
+                          echo "Fast-forwarding origin/$branch to $(Build.SourceVersion)"
+                          git push origin "$(Build.SourceVersion):refs/heads/$branch"
+                        displayName: Update ${{ lower(env.name) }} branch to deployed commit
+                        condition: and(succeeded(), eq(variables['deployedForReal'], 'true'))
