@@ -1,20 +1,23 @@
 # =============================================================================
-# Pipeline: Detect changes (checksums) -> DEV (auto) -> UAT (approval) -> TEST (approval)
+# Pipeline: Detect changes (checksums) -> DEV (auto) -> UAT (approval) -> PROD (approval)
 #
 # Notes
 #  * Approvals cannot be declared in YAML. They are configured on the Azure DevOps
-#    Environments named DEV / UAT / TEST (Pipelines > Environments > <env> >
-#    Approvals and checks). Add an "Approvals" check on UAT and on TEST only.
+#    Environments named DEV / UAT / PROD (Pipelines > Environments > <env> >
+#    Approvals and checks). Add an "Approvals" check on UAT and on PROD only.
 #    DEV has no approval, so it deploys automatically.
 #  * "Merged via PR" is enforced by (a) trigger on `dev` only, (b) pr: none, and
-#    (c) a commit-message guard in the Detect stage (Azure Repos writes
-#    "Merged PR <id>: ..." for completed PRs, including squash merges).
+#    (c) a commit-message guard in the Detect stage. It accepts Azure Repos
+#    ("Merged PR <id>: ...") and GitHub ("Merge pull request #<n> ..." or a
+#    squash/rebase title ending in "(#<n>)"), so it works while the code is still
+#    on GitHub and after a move to Azure Repos. Also add a branch protection rule
+#    on `dev` (require PRs) - the message check alone is not real security.
 #  * Baseline for change detection = manifest of the last SUCCESSFUL run on `dev`.
-#    A run only succeeds once TEST is deployed, so changes that were rejected or
-#    failed in UAT/TEST are automatically re-detected on the next run.
+#    A run only succeeds once PROD is deployed, so changes that were rejected or
+#    failed in UAT/PROD are automatically re-detected on the next run.
 # =============================================================================
 
-name:Syg-pipeline
+name: Syg-pipeline
 
 trigger:
   branches:
@@ -46,7 +49,7 @@ parameters:
         dependsOn: [Detect]
       - name: UAT
         dependsOn: [Detect, DEV]
-      - name: TEST
+      - name: PROD
         dependsOn: [Detect, UAT]
 
 stages:
@@ -73,7 +76,9 @@ stages:
               pipeline: $(System.DefinitionId)
               runVersion: latestFromBranch
               runBranch: refs/heads/dev
-              allowPartiallySucceededBuilds: false
+              # true so the very first run (whose baseline download fails by design and
+              # ends "partially succeeded") can itself become the baseline.
+              allowPartiallySucceededBuilds: true
               allowFailedBuilds: false
               artifact: manifest
               path: $(Pipeline.Workspace)/baseline
@@ -83,13 +88,34 @@ stages:
               out="$(Build.ArtifactStagingDirectory)/changes"
               mkdir -p "$out"
 
+              base="$(Pipeline.Workspace)/baseline/manifest.tsv"
+
               # --- Guard: only act on commits produced by a completed PR ----------
-              msg='$(Build.SourceVersionMessage)'
-              if [[ "$msg" != Merged\ PR* ]]; then
-                echo "Commit is not a PR merge ('$msg'). Nothing to deploy."
+              # The message arrives via the MSG env var (see `env:` below), never
+              # pasted into the script, so quotes/apostrophes in it cannot break bash.
+              msg="${MSG:-}"
+              msg="${msg%%$'\n'*}"   # first line only
+
+              # Accepted "this came from a completed PR" message formats:
+              #   Azure Repos           : "Merged PR 123: title"            (merge + squash)
+              #   GitHub merge commit   : "Merge pull request #12 from ..."
+              #   GitHub squash/rebase  : "title (#12)"
+              re_ado='^Merged PR [0-9]+'
+              re_gh_merge='^Merge pull request #[0-9]+'
+              re_gh_squash='\(#[0-9]+\)[[:space:]]*$'
+
+              if ! [[ "$msg" =~ $re_ado || "$msg" =~ $re_gh_merge || "$msg" =~ $re_gh_squash ]]; then
+                echo "Commit is not a PR merge. Nothing to deploy."
                 echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
                 echo '{"changed":[],"deleted":[]}' > "$out/changes.json"
-                : > "$out/manifest.tsv"
+                # Carry the previous baseline forward unchanged. Publishing an empty
+                # manifest here would make this (successful) run the new baseline and
+                # cause every component to look changed on the next PR merge.
+                if [ -f "$base" ]; then
+                  cp "$base" "$out/manifest.tsv"
+                else
+                  : > "$out/manifest.tsv"
+                fi
                 exit 0
               fi
 
@@ -114,11 +140,11 @@ stages:
               done > "$out/manifest.tsv"
 
               # --- 3. Diff against baseline ---------------------------------------
-              base="$(Pipeline.Workspace)/baseline/manifest.tsv"
               if [ -f "$base" ]; then
                 echo "Baseline found: $(wc -l < "$base") components"
               else
                 echo "No baseline found - treating all components as changed."
+                mkdir -p "$(dirname "$base")"
                 : > "$base"
               fi
 
@@ -144,8 +170,10 @@ stages:
               fi
             name: detect
             displayName: Checksum tracked folders and detect changes
+            env:
+              MSG: $(Build.SourceVersionMessage)
 
-          # changes.json = the single source of truth promoted through DEV -> UAT -> TEST.
+          # changes.json = the single source of truth promoted through DEV -> UAT -> PROD.
           # manifest.tsv = baseline for the next run.
           - publish: $(Build.ArtifactStagingDirectory)/changes/changes.json
             artifact: changes
@@ -156,7 +184,7 @@ stages:
             displayName: Publish manifest (next run's baseline)
 
   # ---------------------------------------------------------------------------
-  # 2. DEPLOY  DEV (automatic) -> UAT (approval) -> TEST (approval)
+  # 2. DEPLOY  DEV (automatic) -> UAT (approval) -> PROD (approval)
   #    Approvals are enforced by the Environment's checks (see header).
   # ---------------------------------------------------------------------------
   - ${{ each env in parameters.environments }}:
@@ -190,31 +218,99 @@ stages:
                     - bash: |
                         set -euo pipefail
                         manifest="$(Pipeline.Workspace)/changes/changes.json"
-                        echo "Deploying to $(targetEnv):"
+                        env_name="$(targetEnv)"
+                        echo "Deploying to $env_name:"
                         jq . "$manifest"
 
-                        deploy_component() {
-                          local comp="$1"
-                          case "$comp" in
-                            Agents/*)  echo "[$(targetEnv)] Deploy agent:  $comp"
-                                       # TODO: replace with real deploy command for agents
-                                       ;;
-                            prompts/*|Prompts/*)
-                                       echo "[$(targetEnv)] Deploy prompt: $comp"
-                                       # TODO: replace with real deploy command for prompts
-                                       ;;
-                            skills/*)  echo "[$(targetEnv)] Deploy skill:  $comp"
-                                       # TODO: replace with real deploy command for skills
-                                       ;;
-                            *)         echo "Unknown component, skipping: $comp" ;;
+                        # --- API configuration (per environment, from pipeline variables) -----
+                        # API_BASE_URL_<ENV> and API_TOKEN_<ENV> are defined in the Azure DevOps
+                        # pipeline UI (token as a *secret* variable). Until they exist, Azure
+                        # leaves the literal text "$(NAME)" behind, which we treat as "not set".
+                        [[ "${API_BASE_URL:-}" == '$'* ]] && API_BASE_URL=''
+                        [[ "${API_TOKEN:-}" == '$'* ]] && API_TOKEN=''
+                        API_BASE_URL="${API_BASE_URL:-}"; API_BASE_URL="${API_BASE_URL%/}"
+                        API_TOKEN="${API_TOKEN:-}"
+
+                        dry_run=false
+                        if [[ -z "$API_BASE_URL" || -z "$API_TOKEN" ]]; then
+                          if [[ "$env_name" == "PROD" ]]; then
+                            echo "##vso[task.logissue type=error]API_BASE_URL_PROD / API_TOKEN_PROD are not configured. Refusing to run PROD as a dry run."
+                            exit 1
+                          fi
+                          dry_run=true
+                          echo "##vso[task.logissue type=warning]API_BASE_URL_${env_name} / API_TOKEN_${env_name} not configured - DRY RUN, no API calls are made."
+                        fi
+
+                        # --- helpers ------------------------------------------------------------
+                        # ASSUMED API CONTRACT (adjust to the real API once known):
+                        #   PUT    {base}/agents|prompts|skills/{name}   multipart field "file"
+                        #   DELETE {base}/agents|prompts|skills/{name}
+                        #   Auth:  Authorization: Bearer <token>
+                        # A folder component is zipped; a single-file component is sent as is.
+                        # {name} = folder name, or file name without extension.
+                        api() {
+                          local method="$1" path="$2"; shift 2
+                          curl -sS --fail-with-body --max-time 120 -X "$method" \
+                               -H "Authorization: Bearer $API_TOKEN" \
+                               "$API_BASE_URL$path" "$@"
+                        }
+
+                        component_name() {
+                          local comp="$1" name
+                          name="$(basename "$comp")"
+                          if [ -d "$comp" ]; then echo "$name"; else echo "${name%.*}"; fi
+                        }
+
+                        kind_of() {
+                          case "$1" in
+                            Agents/*)            echo agents ;;
+                            prompts/*|Prompts/*) echo prompts ;;
+                            skills/*)            echo skills ;;
+                            *)                   echo "" ;;
                           esac
                         }
 
-                        remove_component() {
-                          echo "[$(targetEnv)] Remove: $1"
-                          # TODO: replace with real un-deploy command
+                        deploy_component() {
+                          local comp="$1" kind name file
+                          kind="$(kind_of "$comp")"
+                          if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                          name="$(component_name "$comp")"
+                          if $dry_run; then
+                            echo "[$env_name] DRY RUN  PUT /$kind/$name  <- $comp"; return 0
+                          fi
+                          if [ -d "$comp" ]; then
+                            file="$(mktemp -d)/$name.zip"
+                            (cd "$comp" && zip -rq "$file" .)
+                          else
+                            file="$comp"
+                          fi
+                          echo "[$env_name] PUT /$kind/$name  <- $comp"
+                          api PUT "/$kind/$name" -F "file=@$file"; echo
                         }
 
-                        jq -r '.changed[]' "$manifest" | while IFS= read -r c; do deploy_component "$c"; done
-                        jq -r '.deleted[]' "$manifest" | while IFS= read -r c; do remove_component "$c"; done
-                      displayName: Deploy changed components
+                        remove_component() {
+                          local comp="$1" kind name
+                          kind="$(kind_of "$comp")"
+                          if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                          name="$(component_name "$comp")"
+                          if $dry_run; then
+                            echo "[$env_name] DRY RUN  DELETE /$kind/$name"; return 0
+                          fi
+                          echo "[$env_name] DELETE /$kind/$name"
+                          api DELETE "/$kind/$name"; echo
+                        }
+
+                        # --- run: keep going after a failure, then fail the stage at the end ----
+                        failed=0
+                        while IFS= read -r c; do
+                          ( deploy_component "$c" ) || { echo "##vso[task.logissue type=error]Deploy failed: $c"; failed=1; }
+                        done < <(jq -r '.changed[]' "$manifest")
+                        while IFS= read -r c; do
+                          ( remove_component "$c" ) || { echo "##vso[task.logissue type=error]Remove failed: $c"; failed=1; }
+                        done < <(jq -r '.deleted[]' "$manifest")
+
+                        exit $failed
+                      displayName: Deploy changed components via API
+                      env:
+                        API_BASE_URL: $(API_BASE_URL_${{ env.name }})
+                        API_TOKEN: $(API_TOKEN_${{ env.name }})
