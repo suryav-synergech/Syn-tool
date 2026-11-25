@@ -1,23 +1,31 @@
 # =============================================================================
-# Pipeline: Detect changes (checksums) -> DEV (auto) -> UAT (approval) -> PROD (approval)
+# Pipeline (DEV + UAT): one environment per branch, promoted by pull requests
+#
+#     feature --PR--> dev   => run on dev  : Detect -> DEV  (automatic)
+#     dev     --PR--> uat   => run on uat  : Detect -> UAT  (approval)
+#     uat     --PR--> prod  => handled by the SEPARATE pipeline azure-pipelines-prod.yml
 #
 # Notes
+#  * PROD is intentionally NOT in this file. It has its own pipeline definition
+#    (azure-pipelines-prod.yml) so it can have its own permissions, variables and
+#    approvers. Keep the two files' logic in sync when you change one of them.
+#  * The branch that triggered the run decides the environment (see `environments`
+#    below). There is no cross-environment chaining inside one run any more.
 #  * Approvals cannot be declared in YAML. They are configured on the Azure DevOps
-#    Environments named DEV / UAT / PROD (Pipelines > Environments > <env> >
-#    Approvals and checks). Add an "Approvals" check on UAT and on PROD only.
+#    Environments named DEV / UAT (Pipelines > Environments > <env> >
+#    Approvals and checks). Add an "Approvals" check on UAT only.
 #    DEV has no approval, so it deploys automatically.
-#  * "Merged via PR" is enforced by (a) trigger on `dev` only, (b) pr: none, and
+#  * "Merged via PR" is enforced by (a) trigger on dev/uat only, (b) pr: none, and
 #    (c) a commit-message guard in the Detect stage. It accepts Azure Repos
 #    ("Merged PR <id>: ...") and GitHub ("Merge pull request #<n> ..." or a
-#    squash/rebase title ending in "(#<n>)"), so it works while the code is still
-#    on GitHub and after a move to Azure Repos. Also add a branch protection rule
-#    on `dev` (require PRs) - the message check alone is not real security.
-#  * Branches follow the stages: `dev` is the trigger; after a real successful deploy the
-#    pipeline fast-forwards the `uat` and `prod` branches to the deployed commit. This needs
-#    permission to push to those branches (see the notes in the Azure DevOps setup).
-#  * Baseline for change detection = manifest of the last SUCCESSFUL run on `dev`.
-#    A run only succeeds once PROD is deployed, so changes that were rejected or
-#    failed in UAT/PROD are automatically re-detected on the next run.
+#    squash/rebase title ending in "(#<n>)"). The message check alone is not real
+#    security: also add branch protection on dev and uat (require PRs).
+#  * Use MERGE COMMITS (not squash) for the promotion PRs dev->uat and uat->prod, so the
+#    branch histories stay aligned and later promotion PRs do not conflict.
+#  * Baseline for change detection = manifest of the last SUCCESSFUL run on THE SAME
+#    BRANCH, i.e. the last successful deploy of that environment. A run that is
+#    rejected at the approval gate, fails, or is a dry run does not move the baseline,
+#    so those changes are detected again on the next run.
 # =============================================================================
 
 name: Syg-pipeline
@@ -26,6 +34,7 @@ trigger:
   branches:
     include:
       - dev
+      - uat
   paths:
     include:
       # Folder names must match the repo exactly (git paths are case-sensitive on Linux).
@@ -34,7 +43,7 @@ trigger:
       - skills/*
       - skills-test/*
 
-pr: none   # never build on PR validation; only on the merge into dev
+pr: none   # never build on PR validation; only on the merge into dev / uat
 
 variables:
   - name: tracked_roots
@@ -44,21 +53,19 @@ pool:
   vmImage: ubuntu-latest
 
 parameters:
-  # Order matters: each environment depends on the previous one.
+  # Branch -> environment. Exactly one of these stages is generated per run, chosen
+  # by the branch that triggered the run.
   - name: environments
     type: object
     default:
-      # Detect is listed in every dependsOn so its outputs are readable in the condition.
       - name: DEV
-        dependsOn: [Detect]
+        branch: dev
       - name: UAT
-        dependsOn: [Detect, DEV]
-      - name: PROD
-        dependsOn: [Detect, UAT]
+        branch: uat
 
 stages:
   # ---------------------------------------------------------------------------
-  # 1. DETECT CHANGES
+  # 1. DETECT CHANGES (against the last successful run on this same branch)
   # ---------------------------------------------------------------------------
   - stage: Detect
     displayName: Detect changes (checksums)
@@ -69,8 +76,8 @@ stages:
           - checkout: self
             fetchDepth: 1
 
-          # Baseline manifest from the last successful run of this pipeline on dev.
-          # Absent on the very first run -> everything is treated as changed.
+          # Baseline manifest from the last successful run of this pipeline on THIS branch.
+          # Absent on the first run for the branch -> everything is treated as changed.
           - task: DownloadPipelineArtifact@2
             displayName: Download baseline manifest
             continueOnError: true
@@ -79,7 +86,7 @@ stages:
               project: $(System.TeamProjectId)
               pipeline: $(System.DefinitionId)
               runVersion: latestFromBranch
-              runBranch: refs/heads/dev
+              runBranch: $(Build.SourceBranch)
               # true so the very first run (whose baseline download fails by design and
               # ends "partially succeeded") can itself become the baseline.
               allowPartiallySucceededBuilds: true
@@ -177,8 +184,8 @@ stages:
             env:
               MSG: $(Build.SourceVersionMessage)
 
-          # changes.json = the single source of truth promoted through DEV -> UAT -> PROD.
-          # manifest.tsv = baseline for the next run.
+          # changes.json = what the deploy stage of this run will send to the API.
+          # manifest.tsv = baseline for the next run on this branch.
           - publish: $(Build.ArtifactStagingDirectory)/changes/changes.json
             artifact: changes
             displayName: Publish detected changes
@@ -188,154 +195,141 @@ stages:
             displayName: Publish manifest (next run's baseline)
 
   # ---------------------------------------------------------------------------
-  # 2. DEPLOY  DEV (automatic) -> UAT (approval) -> PROD (approval)
+  # 2. DEPLOY to the ONE environment that belongs to the triggering branch
+  #    dev -> DEV (automatic) | uat -> UAT (approval)
   #    Approvals are enforced by the Environment's checks (see header).
   # ---------------------------------------------------------------------------
   - ${{ each env in parameters.environments }}:
-      - stage: ${{ env.name }}
-        displayName: Deploy to ${{ env.name }}
-        dependsOn: ${{ env.dependsOn }}
-        # Run only if changes were detected upstream and every prior stage succeeded.
-        condition: |
-          and(
-            succeeded(),
-            eq(dependencies.Detect.outputs['Detect.detect.hasChanges'], 'true')
-          )
-        variables:
-          targetEnv: ${{ env.name }}
-        jobs:
-          - deployment: Deploy_${{ env.name }}
-            displayName: Deploy changed components to ${{ env.name }}
-            environment: ${{ env.name }}     # approval gate lives on this environment
-            strategy:
-              runOnce:
-                deploy:
-                  steps:
-                    - checkout: self
-                      fetchDepth: 1
-                      persistCredentials: true   # needed to push the uat/prod branch after deploy
+      - ${{ if eq(variables['Build.SourceBranch'], format('refs/heads/{0}', env.branch)) }}:
+          - stage: ${{ env.name }}
+            displayName: Deploy to ${{ env.name }}
+            dependsOn: Detect
+            # Run only if changes were detected.
+            condition: |
+              and(
+                succeeded(),
+                eq(dependencies.Detect.outputs['Detect.detect.hasChanges'], 'true')
+              )
+            variables:
+              targetEnv: ${{ env.name }}
+            jobs:
+              - deployment: Deploy_${{ env.name }}
+                displayName: Deploy changed components to ${{ env.name }}
+                environment: ${{ env.name }}     # approval gate lives on this environment
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                          fetchDepth: 1
 
-                    # Same changes.json produced once in Detect for every environment.
-                    - download: current
-                      artifact: changes
-                      displayName: Download detected changes
+                        # changes.json produced by Detect in this same run.
+                        - download: current
+                          artifact: changes
+                          displayName: Download detected changes
 
-                    - bash: |
-                        set -euo pipefail
-                        manifest="$(Pipeline.Workspace)/changes/changes.json"
-                        env_name="$(targetEnv)"
-                        echo "Deploying to $env_name:"
-                        jq . "$manifest"
+                        - bash: |
+                            set -euo pipefail
+                            manifest="$(Pipeline.Workspace)/changes/changes.json"
+                            env_name="$(targetEnv)"
+                            echo "Deploying to $env_name:"
+                            jq . "$manifest"
 
-                        # --- API configuration (per environment, from pipeline variables) -----
-                        # API_BASE_URL_<ENV> and API_TOKEN_<ENV> are defined in the Azure DevOps
-                        # pipeline UI (token as a *secret* variable). Until they exist, Azure
-                        # leaves the literal text "$(NAME)" behind, which we treat as "not set".
-                        [[ "${API_BASE_URL:-}" == '$'* ]] && API_BASE_URL=''
-                        [[ "${API_TOKEN:-}" == '$'* ]] && API_TOKEN=''
-                        API_BASE_URL="${API_BASE_URL:-}"; API_BASE_URL="${API_BASE_URL%/}"
-                        API_TOKEN="${API_TOKEN:-}"
+                            # --- API configuration (per environment, from pipeline variables) -----
+                            # API_BASE_URL_<ENV> and API_TOKEN_<ENV> are defined in the Azure DevOps
+                            # pipeline UI (token as a *secret* variable). Until they exist, Azure
+                            # leaves the literal text "$(NAME)" behind, which we treat as "not set".
+                            [[ "${API_BASE_URL:-}" == '$'* ]] && API_BASE_URL=''
+                            [[ "${API_TOKEN:-}" == '$'* ]] && API_TOKEN=''
+                            API_BASE_URL="${API_BASE_URL:-}"; API_BASE_URL="${API_BASE_URL%/}"
+                            API_TOKEN="${API_TOKEN:-}"
 
-                        dry_run=false
-                        if [[ -z "$API_BASE_URL" || -z "$API_TOKEN" ]]; then
-                          if [[ "$env_name" == "PROD" ]]; then
-                            echo "##vso[task.logissue type=error]API_BASE_URL_PROD / API_TOKEN_PROD are not configured. Refusing to run PROD as a dry run."
-                            exit 1
-                          fi
-                          dry_run=true
-                          echo "##vso[task.logissue type=warning]API_BASE_URL_${env_name} / API_TOKEN_${env_name} not configured - DRY RUN, no API calls are made."
-                        fi
+                            # No credentials -> print the plan (dry run) and then FAIL ON PURPOSE.
+                            # A failed run does not become the baseline, so these changes are
+                            # deployed for real once the credentials exist.
+                            dry_run=false
+                            if [[ -z "$API_BASE_URL" || -z "$API_TOKEN" ]]; then
+                              dry_run=true
+                              echo "##vso[task.logissue type=warning]API_BASE_URL_${env_name} / API_TOKEN_${env_name} not configured - DRY RUN: printing the plan only."
+                            fi
 
-                        # --- helpers ------------------------------------------------------------
-                        # ASSUMED API CONTRACT (adjust to the real API once known):
-                        #   PUT    {base}/agents|prompts|skills|skills-test/{name}   multipart field "file"
-                        #   DELETE {base}/agents|prompts|skills|skills-test/{name}
-                        #   Auth:  Authorization: Bearer <token>
-                        # A folder component is zipped; a single-file component is sent as is.
-                        # {name} = folder name, or file name without extension.
-                        api() {
-                          local method="$1" path="$2"; shift 2
-                          curl -sS --fail-with-body --max-time 120 -X "$method" \
-                               -H "Authorization: Bearer $API_TOKEN" \
-                               "$API_BASE_URL$path" "$@"
-                        }
+                            # --- helpers ------------------------------------------------------------
+                            # ASSUMED API CONTRACT (adjust to the real API once known):
+                            #   PUT    {base}/agents|prompts|skills|skills-test/{name}   multipart field "file"
+                            #   DELETE {base}/agents|prompts|skills|skills-test/{name}
+                            #   Auth:  Authorization: Bearer <token>
+                            # A folder component is zipped; a single-file component is sent as is.
+                            # {name} = folder name, or file name without extension.
+                            api() {
+                              local method="$1" path="$2"; shift 2
+                              curl -sS --fail-with-body --max-time 120 -X "$method" \
+                                   -H "Authorization: Bearer $API_TOKEN" \
+                                   "$API_BASE_URL$path" "$@"
+                            }
 
-                        component_name() {
-                          local comp="$1" name
-                          name="$(basename "$comp")"
-                          if [ -d "$comp" ]; then echo "$name"; else echo "${name%.*}"; fi
-                        }
+                            component_name() {
+                              local comp="$1" name
+                              name="$(basename "$comp")"
+                              if [ -d "$comp" ]; then echo "$name"; else echo "${name%.*}"; fi
+                            }
 
-                        kind_of() {
-                          case "$1" in
-                            agents/*) echo agents ;;
-                            prompt/*) echo prompts ;;   # folder is `prompt`, API path is /prompts
-                            skills/*) echo skills ;;
-                            skills-test/*) echo skills-test ;;
-                            *)                   echo "" ;;
-                          esac
-                        }
+                            kind_of() {
+                              case "$1" in
+                                agents/*) echo agents ;;
+                                prompt/*) echo prompts ;;   # folder is `prompt`, API path is /prompts
+                                skills/*) echo skills ;;
+                                skills-test/*) echo skills-test ;;
+                                *)                   echo "" ;;
+                              esac
+                            }
 
-                        deploy_component() {
-                          local comp="$1" kind name file
-                          kind="$(kind_of "$comp")"
-                          if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
-                          name="$(component_name "$comp")"
-                          if $dry_run; then
-                            echo "[$env_name] DRY RUN  PUT /$kind/$name  <- $comp"; return 0
-                          fi
-                          if [ -d "$comp" ]; then
-                            file="$(mktemp -d)/$name.zip"
-                            (cd "$comp" && zip -rq "$file" .)
-                          else
-                            file="$comp"
-                          fi
-                          echo "[$env_name] PUT /$kind/$name  <- $comp"
-                          api PUT "/$kind/$name" -F "file=@$file"; echo
-                        }
+                            deploy_component() {
+                              local comp="$1" kind name file
+                              kind="$(kind_of "$comp")"
+                              if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                              name="$(component_name "$comp")"
+                              if $dry_run; then
+                                echo "[$env_name] DRY RUN  PUT /$kind/$name  <- $comp"; return 0
+                              fi
+                              if [ -d "$comp" ]; then
+                                file="$(mktemp -d)/$name.zip"
+                                (cd "$comp" && zip -rq "$file" .)
+                              else
+                                file="$comp"
+                              fi
+                              echo "[$env_name] PUT /$kind/$name  <- $comp"
+                              api PUT "/$kind/$name" -F "file=@$file"; echo
+                            }
 
-                        remove_component() {
-                          local comp="$1" kind name
-                          kind="$(kind_of "$comp")"
-                          if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
-                          name="$(component_name "$comp")"
-                          if $dry_run; then
-                            echo "[$env_name] DRY RUN  DELETE /$kind/$name"; return 0
-                          fi
-                          echo "[$env_name] DELETE /$kind/$name"
-                          api DELETE "/$kind/$name"; echo
-                        }
+                            remove_component() {
+                              local comp="$1" kind name
+                              kind="$(kind_of "$comp")"
+                              if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                              name="$(component_name "$comp")"
+                              if $dry_run; then
+                                echo "[$env_name] DRY RUN  DELETE /$kind/$name"; return 0
+                              fi
+                              echo "[$env_name] DELETE /$kind/$name"
+                              api DELETE "/$kind/$name"; echo
+                            }
 
-                        # --- run: keep going after a failure, then fail the stage at the end ----
-                        failed=0
-                        while IFS= read -r c; do
-                          ( deploy_component "$c" ) || { echo "##vso[task.logissue type=error]Deploy failed: $c"; failed=1; }
-                        done < <(jq -r '.changed[]' "$manifest")
-                        while IFS= read -r c; do
-                          ( remove_component "$c" ) || { echo "##vso[task.logissue type=error]Remove failed: $c"; failed=1; }
-                        done < <(jq -r '.deleted[]' "$manifest")
+                            # --- run: keep going after a failure, then fail the stage at the end ----
+                            failed=0
+                            while IFS= read -r c; do
+                              ( deploy_component "$c" ) || { echo "##vso[task.logissue type=error]Deploy failed: $c"; failed=1; }
+                            done < <(jq -r '.changed[]' "$manifest")
+                            while IFS= read -r c; do
+                              ( remove_component "$c" ) || { echo "##vso[task.logissue type=error]Remove failed: $c"; failed=1; }
+                            done < <(jq -r '.deleted[]' "$manifest")
 
-                        # Tell the next step this was a real deploy (not a dry run).
-                        if ! $dry_run; then
-                          echo "##vso[task.setvariable variable=deployedForReal]true"
-                        fi
+                            if $dry_run; then
+                              echo "##vso[task.logissue type=error]Dry run only - nothing was deployed. Failing on purpose so this run does not become the baseline. Set API_BASE_URL_${env_name} and API_TOKEN_${env_name}, then re-run."
+                              exit 1
+                            fi
 
-                        exit $failed
-                      displayName: Deploy changed components via API
-                      env:
-                        API_BASE_URL: $(API_BASE_URL_${{ env.name }})
-                        API_TOKEN: $(API_TOKEN_${{ env.name }})
-
-                    # Keep the environment branch in step with the pipeline: after a REAL,
-                    # successful deploy, fast-forward the `uat` / `prod` branch to the commit
-                    # that was just deployed. DEV needs nothing (it is the `dev` branch itself).
-                    # Fast-forward only (no --force): if the branch has diverged, the push fails
-                    # loudly instead of overwriting anything.
-                    - ${{ if ne(env.name, 'DEV') }}:
-                      - bash: |
-                          set -euo pipefail
-                          branch='${{ lower(env.name) }}'
-                          echo "Fast-forwarding origin/$branch to $(Build.SourceVersion)"
-                          git push origin "$(Build.SourceVersion):refs/heads/$branch"
-                        displayName: Update ${{ lower(env.name) }} branch to deployed commit
-                        condition: and(succeeded(), eq(variables['deployedForReal'], 'true'))
+                            exit $failed
+                          displayName: Deploy changed components via API
+                          env:
+                            API_BASE_URL: $(API_BASE_URL_${{ env.name }})
+                            API_TOKEN: $(API_TOKEN_${{ env.name }})
+                            

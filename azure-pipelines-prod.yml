@@ -1,0 +1,329 @@
+# =============================================================================
+# Pipeline (PROD only): deploys when a PR is merged into `prod`
+#
+#     uat --PR--> prod  => run on prod : Detect -> PROD (approval)
+#
+# DEV and UAT are handled by the SEPARATE pipeline azure-pipelines.yml. This is a
+# separate pipeline definition, so it has its own baseline (last successful PROD
+# deploy), variables, permissions and approvers. Keep the two files' logic in sync.
+#
+# Notes
+#  * The branch that triggered the run decides the environment (see `environments`
+#    below). There is no cross-environment chaining inside one run any more.
+#  * Approvals cannot be declared in YAML. They are configured on the Azure DevOps
+#    Environment named PROD (Pipelines > Environments > PROD > Approvals and checks).
+#    Add an "Approvals" check on PROD.
+#  * "Merged via PR" is enforced by (a) trigger on prod only, (b) pr: none, and
+#    (c) a commit-message guard in the Detect stage. It accepts Azure Repos
+#    ("Merged PR <id>: ...") and GitHub ("Merge pull request #<n> ..." or a
+#    squash/rebase title ending in "(#<n>)"). The message check alone is not real
+#    security: also add branch protection on prod (require PRs).
+#  * Use a MERGE COMMIT (not squash) for the promotion PR uat->prod, so the
+#    branch histories stay aligned and later promotion PRs do not conflict.
+#  * Baseline for change detection = manifest of the last SUCCESSFUL run on THE SAME
+#    BRANCH, i.e. the last successful deploy of that environment. A run that is
+#    rejected at the approval gate, fails, or is a dry run does not move the baseline,
+#    so those changes are detected again on the next run.
+# =============================================================================
+
+name: Syg-pipeline-prod
+
+trigger:
+  branches:
+    include:
+      - prod
+  paths:
+    include:
+      # Folder names must match the repo exactly (git paths are case-sensitive on Linux).
+      - agents/*
+      - prompt/*
+      - skills/*
+      - skills-test/*
+
+pr: none   # never build on PR validation; only on the merge into prod
+
+variables:
+  - name: tracked_roots
+    value: 'agents prompt skills skills-test'
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  # Branch -> environment. Exactly one of these stages is generated per run, chosen
+  # by the branch that triggered the run.
+  - name: environments
+    type: object
+    default:
+      - name: PROD
+        branch: prod
+
+stages:
+  # ---------------------------------------------------------------------------
+  # 1. DETECT CHANGES (against the last successful run on this same branch)
+  # ---------------------------------------------------------------------------
+  - stage: Detect
+    displayName: Detect changes (checksums)
+    jobs:
+      - job: Detect
+        displayName: Compute checksums and diff against last successful run
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          # Baseline manifest from the last successful run of this pipeline on THIS branch.
+          # Absent on the first run for the branch -> everything is treated as changed.
+          - task: DownloadPipelineArtifact@2
+            displayName: Download baseline manifest
+            continueOnError: true
+            inputs:
+              source: specific
+              project: $(System.TeamProjectId)
+              pipeline: $(System.DefinitionId)
+              runVersion: latestFromBranch
+              runBranch: $(Build.SourceBranch)
+              # true so the very first run (whose baseline download fails by design and
+              # ends "partially succeeded") can itself become the baseline.
+              allowPartiallySucceededBuilds: true
+              allowFailedBuilds: false
+              artifact: manifest
+              path: $(Pipeline.Workspace)/baseline
+
+          - bash: |
+              set -euo pipefail
+              out="$(Build.ArtifactStagingDirectory)/changes"
+              mkdir -p "$out"
+
+              base="$(Pipeline.Workspace)/baseline/manifest.tsv"
+
+              # --- Guard: only act on commits produced by a completed PR ----------
+              # The message arrives via the MSG env var (see `env:` below), never
+              # pasted into the script, so quotes/apostrophes in it cannot break bash.
+              msg="${MSG:-}"
+              msg="${msg%%$'\n'*}"   # first line only
+
+              # Accepted "this came from a completed PR" message formats:
+              #   Azure Repos           : "Merged PR 123: title"            (merge + squash)
+              #   GitHub merge commit   : "Merge pull request #12 from ..."
+              #   GitHub squash/rebase  : "title (#12)"
+              re_ado='^Merged PR [0-9]+'
+              re_gh_merge='^Merge pull request #[0-9]+'
+              re_gh_squash='\(#[0-9]+\)[[:space:]]*$'
+
+              if ! [[ "$msg" =~ $re_ado || "$msg" =~ $re_gh_merge || "$msg" =~ $re_gh_squash ]]; then
+                echo "Commit is not a PR merge. Nothing to deploy."
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+                echo '{"changed":[],"deleted":[]}' > "$out/changes.json"
+                # Carry the previous baseline forward unchanged. Publishing an empty
+                # manifest here would make this (successful) run the new baseline and
+                # cause every component to look changed on the next PR merge.
+                if [ -f "$base" ]; then
+                  cp "$base" "$out/manifest.tsv"
+                else
+                  : > "$out/manifest.tsv"
+                fi
+                exit 0
+              fi
+
+              # --- 1. Checksum every tracked file ---------------------------------
+              : > "$out/files.txt"
+              for root in $(tracked_roots); do
+                if [ -d "$root" ]; then
+                  find "$root" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum >> "$out/files.txt"
+                fi
+              done
+
+              # --- 2. Group into components ---------------------------------------
+              # Component = Root/<first-level child> (a sub-folder or a single file).
+              # Folder components get one combined checksum over all files inside.
+              awk '{h=substr($0,1,64); p=substr($0,67); n=split(p,a,"/");
+                    c=(n>2)?a[1]"/"a[2]:p; printf "%s\t%s  %s\n", c, h, p}' \
+                  "$out/files.txt" | LC_ALL=C sort > "$out/_files.tsv"
+
+              cut -f1 "$out/_files.tsv" | uniq | while IFS= read -r comp; do
+                h=$(awk -F'\t' -v c="$comp" '$1==c{print $2}' "$out/_files.tsv" | sha256sum | cut -d' ' -f1)
+                printf '%s\t%s\n' "$comp" "$h"
+              done > "$out/manifest.tsv"
+
+              # --- 3. Diff against baseline ---------------------------------------
+              if [ -f "$base" ]; then
+                echo "Baseline found: $(wc -l < "$base") components"
+              else
+                echo "No baseline found - treating all components as changed."
+                mkdir -p "$(dirname "$base")"
+                : > "$base"
+              fi
+
+              # changed = new or checksum differs ; deleted = in baseline, not now
+              changed=$(awk -F'\t' 'NR==FNR{b[$1]=$2; next} !($1 in b) || b[$1]!=$2 {print $1}' \
+                          "$base" "$out/manifest.tsv")
+              deleted=$(awk -F'\t' 'NR==FNR{c[$1]=1; next} !($1 in c){print $1}' \
+                          "$out/manifest.tsv" "$base")
+
+              to_json() { printf '%s' "$1" | jq -R -s -c 'split("\n") | map(select(length>0))'; }
+              jq -n --argjson c "$(to_json "$changed")" --argjson d "$(to_json "$deleted")" \
+                 '{changed:$c, deleted:$d}' > "$out/changes.json"
+
+              rm -f "$out/_files.tsv" "$out/files.txt"
+
+              echo "---- Detected changes ----"
+              jq . "$out/changes.json"
+
+              if [ -n "$changed$deleted" ]; then
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]true"
+              else
+                echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+              fi
+            name: detect
+            displayName: Checksum tracked folders and detect changes
+            env:
+              MSG: $(Build.SourceVersionMessage)
+
+          # changes.json = what the deploy stage of this run will send to the API.
+          # manifest.tsv = baseline for the next run on this branch.
+          - publish: $(Build.ArtifactStagingDirectory)/changes/changes.json
+            artifact: changes
+            displayName: Publish detected changes
+
+          - publish: $(Build.ArtifactStagingDirectory)/changes/manifest.tsv
+            artifact: manifest
+            displayName: Publish manifest (next run's baseline)
+
+  # ---------------------------------------------------------------------------
+  # 2. DEPLOY to the ONE environment that belongs to the triggering branch
+  #    prod -> PROD (approval)
+  #    Approvals are enforced by the Environment's checks (see header).
+  # ---------------------------------------------------------------------------
+  - ${{ each env in parameters.environments }}:
+      - ${{ if eq(variables['Build.SourceBranch'], format('refs/heads/{0}', env.branch)) }}:
+          - stage: ${{ env.name }}
+            displayName: Deploy to ${{ env.name }}
+            dependsOn: Detect
+            # Run only if changes were detected.
+            condition: |
+              and(
+                succeeded(),
+                eq(dependencies.Detect.outputs['Detect.detect.hasChanges'], 'true')
+              )
+            variables:
+              targetEnv: ${{ env.name }}
+            jobs:
+              - deployment: Deploy_${{ env.name }}
+                displayName: Deploy changed components to ${{ env.name }}
+                environment: ${{ env.name }}     # approval gate lives on this environment
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                          fetchDepth: 1
+
+                        # changes.json produced by Detect in this same run.
+                        - download: current
+                          artifact: changes
+                          displayName: Download detected changes
+
+                        - bash: |
+                            set -euo pipefail
+                            manifest="$(Pipeline.Workspace)/changes/changes.json"
+                            env_name="$(targetEnv)"
+                            echo "Deploying to $env_name:"
+                            jq . "$manifest"
+
+                            # --- API configuration (per environment, from pipeline variables) -----
+                            # API_BASE_URL_<ENV> and API_TOKEN_<ENV> are defined in the Azure DevOps
+                            # pipeline UI (token as a *secret* variable). Until they exist, Azure
+                            # leaves the literal text "$(NAME)" behind, which we treat as "not set".
+                            [[ "${API_BASE_URL:-}" == '$'* ]] && API_BASE_URL=''
+                            [[ "${API_TOKEN:-}" == '$'* ]] && API_TOKEN=''
+                            API_BASE_URL="${API_BASE_URL:-}"; API_BASE_URL="${API_BASE_URL%/}"
+                            API_TOKEN="${API_TOKEN:-}"
+
+                            # No credentials -> print the plan (dry run) and then FAIL ON PURPOSE.
+                            # A failed run does not become the baseline, so these changes are
+                            # deployed for real once the credentials exist.
+                            dry_run=false
+                            if [[ -z "$API_BASE_URL" || -z "$API_TOKEN" ]]; then
+                              dry_run=true
+                              echo "##vso[task.logissue type=warning]API_BASE_URL_${env_name} / API_TOKEN_${env_name} not configured - DRY RUN: printing the plan only."
+                            fi
+
+                            # --- helpers ------------------------------------------------------------
+                            # ASSUMED API CONTRACT (adjust to the real API once known):
+                            #   PUT    {base}/agents|prompts|skills|skills-test/{name}   multipart field "file"
+                            #   DELETE {base}/agents|prompts|skills|skills-test/{name}
+                            #   Auth:  Authorization: Bearer <token>
+                            # A folder component is zipped; a single-file component is sent as is.
+                            # {name} = folder name, or file name without extension.
+                            api() {
+                              local method="$1" path="$2"; shift 2
+                              curl -sS --fail-with-body --max-time 120 -X "$method" \
+                                   -H "Authorization: Bearer $API_TOKEN" \
+                                   "$API_BASE_URL$path" "$@"
+                            }
+
+                            component_name() {
+                              local comp="$1" name
+                              name="$(basename "$comp")"
+                              if [ -d "$comp" ]; then echo "$name"; else echo "${name%.*}"; fi
+                            }
+
+                            kind_of() {
+                              case "$1" in
+                                agents/*) echo agents ;;
+                                prompt/*) echo prompts ;;   # folder is `prompt`, API path is /prompts
+                                skills/*) echo skills ;;
+                                skills-test/*) echo skills-test ;;
+                                *)                   echo "" ;;
+                              esac
+                            }
+
+                            deploy_component() {
+                              local comp="$1" kind name file
+                              kind="$(kind_of "$comp")"
+                              if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                              name="$(component_name "$comp")"
+                              if $dry_run; then
+                                echo "[$env_name] DRY RUN  PUT /$kind/$name  <- $comp"; return 0
+                              fi
+                              if [ -d "$comp" ]; then
+                                file="$(mktemp -d)/$name.zip"
+                                (cd "$comp" && zip -rq "$file" .)
+                              else
+                                file="$comp"
+                              fi
+                              echo "[$env_name] PUT /$kind/$name  <- $comp"
+                              api PUT "/$kind/$name" -F "file=@$file"; echo
+                            }
+
+                            remove_component() {
+                              local comp="$1" kind name
+                              kind="$(kind_of "$comp")"
+                              if [ -z "$kind" ]; then echo "Unknown component, skipping: $comp"; return 0; fi
+                              name="$(component_name "$comp")"
+                              if $dry_run; then
+                                echo "[$env_name] DRY RUN  DELETE /$kind/$name"; return 0
+                              fi
+                              echo "[$env_name] DELETE /$kind/$name"
+                              api DELETE "/$kind/$name"; echo
+                            }
+
+                            # --- run: keep going after a failure, then fail the stage at the end ----
+                            failed=0
+                            while IFS= read -r c; do
+                              ( deploy_component "$c" ) || { echo "##vso[task.logissue type=error]Deploy failed: $c"; failed=1; }
+                            done < <(jq -r '.changed[]' "$manifest")
+                            while IFS= read -r c; do
+                              ( remove_component "$c" ) || { echo "##vso[task.logissue type=error]Remove failed: $c"; failed=1; }
+                            done < <(jq -r '.deleted[]' "$manifest")
+
+                            if $dry_run; then
+                              echo "##vso[task.logissue type=error]Dry run only - nothing was deployed. Failing on purpose so this run does not become the baseline. Set API_BASE_URL_${env_name} and API_TOKEN_${env_name}, then re-run."
+                              exit 1
+                            fi
+
+                            exit $failed
+                          displayName: Deploy changed components via API
+                          env:
+                            API_BASE_URL: $(API_BASE_URL_${{ env.name }})
+                            API_TOKEN: $(API_TOKEN_${{ env.name }})
